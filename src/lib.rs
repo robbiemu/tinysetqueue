@@ -6,7 +6,153 @@
 pub mod prelude {
     #[cfg(feature = "pow2")]
     pub use super::TinySetQueuePow2;
-    pub use super::{MembershipMode, PushResult, TinySetQueue};
+    pub use super::{MembershipMode, PushResult, SetBacking, TinySetQueue};
+}
+
+mod private {
+    pub trait Sealed {}
+}
+
+/// Behavior required from membership backings.
+///
+/// This trait is sealed; it can only be implemented for types provided by this
+/// crate. Users opt into different behaviors by supplying different backing
+/// slices (e.g. `[bool]` or `[u64]`) to [`TinySetQueue::new`].
+pub trait SetBacking: private::Sealed {
+    /// Number of representable entries in the membership domain.
+    fn capacity(&self) -> usize;
+    /// Returns `true` when the given index is present.
+    fn contains(&self, index: usize) -> bool;
+    /// Inserts the given index.
+    fn insert(&mut self, index: usize);
+    /// Removes the given index.
+    fn remove(&mut self, index: usize);
+    /// Clears all membership information.
+    fn clear_all(&mut self);
+}
+
+impl private::Sealed for [bool] {}
+
+impl SetBacking for [bool] {
+    #[inline(always)]
+    fn capacity(&self) -> usize {
+        self.len()
+    }
+
+    #[inline(always)]
+    fn contains(&self, index: usize) -> bool {
+        self[index]
+    }
+
+    #[inline(always)]
+    fn insert(&mut self, index: usize) {
+        self[index] = true;
+    }
+
+    #[inline(always)]
+    fn remove(&mut self, index: usize) {
+        self[index] = false;
+    }
+
+    fn clear_all(&mut self) {
+        self.fill(false);
+    }
+}
+
+impl private::Sealed for [u64] {}
+
+impl SetBacking for [u64] {
+    #[inline(always)]
+    fn capacity(&self) -> usize {
+        self.len() << 6
+    }
+
+    #[inline(always)]
+    fn contains(&self, index: usize) -> bool {
+        let word = index >> 6;
+        let bit = index & 63;
+        (self[word] & (1u64 << bit)) != 0
+    }
+
+    #[inline(always)]
+    fn insert(&mut self, index: usize) {
+        let word = index >> 6;
+        let bit = index & 63;
+        self[word] |= 1u64 << bit;
+    }
+
+    #[inline(always)]
+    fn remove(&mut self, index: usize) {
+        let word = index >> 6;
+        let bit = index & 63;
+        self[word] &= !(1u64 << bit);
+    }
+
+    fn clear_all(&mut self) {
+        self.fill(0);
+    }
+}
+
+impl<const N: usize> private::Sealed for [bool; N] {}
+
+impl<const N: usize> SetBacking for [bool; N] {
+    #[inline(always)]
+    fn capacity(&self) -> usize {
+        N
+    }
+
+    #[inline(always)]
+    fn contains(&self, index: usize) -> bool {
+        self[index]
+    }
+
+    #[inline(always)]
+    fn insert(&mut self, index: usize) {
+        self[index] = true;
+    }
+
+    #[inline(always)]
+    fn remove(&mut self, index: usize) {
+        self[index] = false;
+    }
+
+    fn clear_all(&mut self) {
+        self.fill(false);
+    }
+}
+
+impl<const N: usize> private::Sealed for [u64; N] {}
+
+impl<const N: usize> SetBacking for [u64; N] {
+    #[inline(always)]
+    fn capacity(&self) -> usize {
+        N << 6
+    }
+
+    #[inline(always)]
+    fn contains(&self, index: usize) -> bool {
+        let word = index >> 6;
+        let bit = index & 63;
+        (self[word] & (1u64 << bit)) != 0
+    }
+
+    #[inline(always)]
+    fn insert(&mut self, index: usize) {
+        let word = index >> 6;
+        let bit = index & 63;
+        self[word] |= 1u64 << bit;
+    }
+
+    #[inline(always)]
+    fn remove(&mut self, index: usize) {
+        let word = index >> 6;
+        let bit = index & 63;
+        self[word] &= !(1u64 << bit);
+    }
+
+    fn clear_all(&mut self) {
+        self.fill(0);
+    }
 }
 
 /// Result of attempting to enqueue a value.
@@ -31,32 +177,36 @@ pub enum MembershipMode {
 ///
 /// Values are converted to indices via [`Into<usize>`], so the queue works best when
 /// keys are dense integers in the range `0..N`. Sparse identifiers (e.g. `{5, 1_000_000}`)
-/// require an `in_queue` slice large enough to cover the full domain.
-pub struct TinySetQueue<'a, T> {
+/// require a membership backing large enough to cover the full domain.
+pub struct TinySetQueue<'a, T, S>
+where
+    S: SetBacking + ?Sized,
+{
     buf: &'a mut [T],
-    in_queue: &'a mut [bool],
+    in_queue: &'a mut S,
     mode: MembershipMode,
     head: usize,
     tail: usize,
     len: usize,
 }
 
-impl<'a, T> TinySetQueue<'a, T>
+impl<'a, T, S> TinySetQueue<'a, T, S>
 where
     T: Copy + Into<usize>,
+    S: SetBacking + ?Sized,
 {
     /// Constructs a queue backed by caller-provided storage.
     ///
     /// * `buf` supplies the ring-buffer storage used for FIFO ordering.
-    /// * `in_queue` is the direct-mapped membership bitmap.
+    /// * `in_queue` is the direct-mapped membership backing (e.g. `[bool]`, `[u64]`).
     /// * `mode` determines whether membership clears on `pop`.
     ///
-    /// `in_queue.len()` must be larger than any index produced by `value.into()`.
-    /// When the `clear_on_new` feature (enabled by default) is active, the membership
-    /// bitmap is cleared on construction to prevent stale flags.
-    pub fn new(buf: &'a mut [T], in_queue: &'a mut [bool], mode: MembershipMode) -> Self {
+    /// `in_queue.capacity()` must exceed any index produced by `value.into()`. When the
+    /// `clear_on_new` feature (enabled by default) is active, the backing is cleared to
+    /// prevent stale membership flags.
+    pub fn new(buf: &'a mut [T], in_queue: &'a mut S, mode: MembershipMode) -> Self {
         #[cfg(feature = "clear_on_new")]
-        in_queue.fill(false);
+        in_queue.clear_all();
         TinySetQueue {
             buf,
             in_queue,
@@ -71,7 +221,7 @@ where
     ///
     /// All membership flags are reset and the queue becomes empty.
     pub fn clear(&mut self) {
-        self.in_queue.fill(false);
+        self.in_queue.clear_all();
         self.head = 0;
         self.tail = 0;
         self.len = 0;
@@ -106,15 +256,15 @@ where
     /// # Errors
     ///
     /// Returns `Err(value)` if the queue is full or if `value.into()` exceeds the
-    /// bounds of the membership bitmap.
+    /// bounds of the membership backing.
     pub fn push(&mut self, value: T) -> Result<PushResult, T> {
         let idx: usize = value.into();
 
-        if idx >= self.in_queue.len() {
+        if idx >= self.in_queue.capacity() {
             return Err(value);
         }
 
-        if self.in_queue[idx] {
+        if self.in_queue.contains(idx) {
             return Ok(PushResult::AlreadyPresent);
         }
 
@@ -123,7 +273,7 @@ where
         }
 
         self.buf[self.tail] = value;
-        self.in_queue[idx] = true;
+        self.in_queue.insert(idx);
 
         self.tail = (self.tail + 1) % self.buf.len();
         self.len += 1;
@@ -144,7 +294,7 @@ where
         let idx: usize = value.into();
 
         if matches!(self.mode, MembershipMode::InQueue) {
-            self.in_queue[idx] = false;
+            self.in_queue.remove(idx);
         }
 
         self.head = (self.head + 1) % self.buf.len();
@@ -156,12 +306,15 @@ where
 
 /// A power-of-two capacity variant that uses bit masking for wrap-around.
 ///
-/// As with [`TinySetQueue`], membership is direct-mapped: the membership bitmap must be
+/// As with [`TinySetQueue`], membership is direct-mapped: the membership backing must be
 /// large enough to cover the entire domain addressable by `T::into()`.
 #[cfg(feature = "pow2")]
-pub struct TinySetQueuePow2<'a, T> {
+pub struct TinySetQueuePow2<'a, T, S>
+where
+    S: SetBacking + ?Sized,
+{
     buf: &'a mut [T],
-    in_queue: &'a mut [bool],
+    in_queue: &'a mut S,
     mode: MembershipMode,
     mask: usize,
     head: usize,
@@ -170,22 +323,23 @@ pub struct TinySetQueuePow2<'a, T> {
 }
 
 #[cfg(feature = "pow2")]
-impl<'a, T> TinySetQueuePow2<'a, T>
+impl<'a, T, S> TinySetQueuePow2<'a, T, S>
 where
     T: Copy + Into<usize>,
+    S: SetBacking + ?Sized,
 {
     /// Constructs a queue backed by power-of-two-sized storage.
     ///
     /// # Panics
     ///
     /// Panics if `buf.len()` is not a power of two.
-    pub fn new(buf: &'a mut [T], in_queue: &'a mut [bool], mode: MembershipMode) -> Self {
+    pub fn new(buf: &'a mut [T], in_queue: &'a mut S, mode: MembershipMode) -> Self {
         assert!(
             buf.len().is_power_of_two(),
             "buffer length must be a power of two"
         );
         #[cfg(feature = "clear_on_new")]
-        in_queue.fill(false);
+        in_queue.clear_all();
         let mask = buf.len() - 1;
         TinySetQueuePow2 {
             buf,
@@ -200,7 +354,7 @@ where
 
     /// Clears the queue without freeing any backing storage.
     pub fn clear(&mut self) {
-        self.in_queue.fill(false);
+        self.in_queue.clear_all();
         self.head = 0;
         self.tail = 0;
         self.len = 0;
@@ -229,11 +383,11 @@ where
     pub fn push(&mut self, value: T) -> Result<PushResult, T> {
         let idx: usize = value.into();
 
-        if idx >= self.in_queue.len() {
+        if idx >= self.in_queue.capacity() {
             return Err(value);
         }
 
-        if self.in_queue[idx] {
+        if self.in_queue.contains(idx) {
             return Ok(PushResult::AlreadyPresent);
         }
 
@@ -242,7 +396,7 @@ where
         }
 
         self.buf[self.tail] = value;
-        self.in_queue[idx] = true;
+        self.in_queue.insert(idx);
 
         self.tail = (self.tail + 1) & self.mask;
         self.len += 1;
@@ -258,7 +412,7 @@ where
         let value = self.buf[self.head];
         let idx: usize = value.into();
         if matches!(self.mode, MembershipMode::InQueue) {
-            self.in_queue[idx] = false;
+            self.in_queue.remove(idx);
         }
 
         self.head = (self.head + 1) & self.mask;
@@ -395,9 +549,44 @@ mod tests {
         assert_eq!(queue.push(0), Err(0));
         assert_eq!(queue.pop(), None);
     }
+
+    #[test]
+    fn bitset_backing_handles_high_indices() {
+        let mut buf = [0u16; 4];
+        let mut membership = [0u64; 2]; // capacity 128
+        let mut queue = TinySetQueue::new(&mut buf, &mut membership, MembershipMode::InQueue);
+
+        assert_eq!(queue.push(0), Ok(PushResult::Inserted));
+        assert_eq!(queue.push(63), Ok(PushResult::Inserted));
+        assert_eq!(queue.push(63), Ok(PushResult::AlreadyPresent));
+        assert_eq!(queue.push(64), Ok(PushResult::Inserted));
+        assert_eq!(queue.pop(), Some(0));
+        assert_eq!(queue.push(0), Ok(PushResult::Inserted)); // membership cleared after pop
+    }
+
+    #[test]
+    fn bitset_backing_enforces_capacity() {
+        let mut buf = [0u8; 2];
+        let mut membership = [0u64; 1]; // capacity 64
+        let mut queue = TinySetQueue::new(&mut buf, &mut membership, MembershipMode::InQueue);
+
+        assert_eq!(queue.push(63), Ok(PushResult::Inserted));
+        assert_eq!(queue.push(64), Err(64)); // out of range
+    }
+
+    #[test]
+    fn bitset_visited_mode_persists_membership() {
+        let mut buf = [0u8; 2];
+        let mut membership = [0u64; 1];
+        let mut queue = TinySetQueue::new(&mut buf, &mut membership, MembershipMode::Visited);
+
+        assert_eq!(queue.push(10), Ok(PushResult::Inserted));
+        assert_eq!(queue.pop(), Some(10));
+        assert_eq!(queue.push(10), Ok(PushResult::AlreadyPresent));
+    }
 }
 
-#[cfg(all(test, feature = "pow2"))]
+#[cfg(all(test, feature = "pow2", feature = "std"))]
 mod pow2_tests {
     use super::{MembershipMode, PushResult, TinySetQueuePow2};
 
@@ -430,5 +619,17 @@ mod pow2_tests {
         assert_eq!(queue.pop(), Some(3));
         assert_eq!(queue.pop(), Some(0));
         assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn pow2_supports_bitset_backing() {
+        let mut buf = [0u8; 4];
+        let mut membership = [0u64; 1];
+        let mut queue = TinySetQueuePow2::new(&mut buf, &mut membership, MembershipMode::InQueue);
+
+        assert_eq!(queue.push(1), Ok(PushResult::Inserted));
+        assert_eq!(queue.push(17), Ok(PushResult::Inserted));
+        assert_eq!(queue.pop(), Some(1));
+        assert_eq!(queue.push(1), Ok(PushResult::Inserted));
     }
 }

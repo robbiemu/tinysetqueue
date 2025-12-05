@@ -7,6 +7,7 @@
 - Direct-mapped membership bitmap deduplicates enqueues in O(1)
 - Two membership modes: `InQueue` (requeue after pop) and `Visited` (ban after first insert)
 - `no_std` by default; opt into the `std` feature when desired
+- Works with `[bool]` backings for speed or `[u64]` bitsets for dense domains
 - Zero external dependencies and zero unsafe code
 
 ## Quick Start
@@ -27,6 +28,26 @@ assert_eq!(queue.push(4), Ok(PushResult::AlreadyPresent));
 assert_eq!(queue.pop(), Some(4));
 assert_eq!(queue.push(4), Ok(PushResult::Inserted)); // membership cleared by pop
 ```
+
+## Choosing a Backing
+
+`TinySetQueue` accepts any membership storage that implements its sealed `SetBacking` trait. Supply the backing that best matches your constraints:
+
+```rust
+use tinysetqueue::{MembershipMode, TinySetQueue};
+
+let mut buf = [0u16; 4];
+
+// Fast path: 1 byte per element.
+let mut bitmap = [false; 32];
+let mut queue = TinySetQueue::new(&mut buf, &mut bitmap, MembershipMode::InQueue);
+
+// Memory-dense path: 1 bit per element (requires domain <= 64 * backing.len()).
+let mut bitset = [0u64; 1];
+let mut dense_queue = TinySetQueue::new(&mut buf, &mut bitset, MembershipMode::InQueue);
+```
+
+Both queues share the same API; the compiler infers the correct backing behavior from the slice you pass.
 
 ## Usage Notes
 
@@ -51,7 +72,7 @@ assert_eq!(queue.push(4), Ok(PushResult::Inserted)); // membership cleared by po
 
 ## Power-of-Two Variant
 
-For workloads that need the lowest possible overhead on fixed-length buffers, enable the `pow2` feature and use `TinySetQueuePow2`. This variant requires the queue capacity to be a power of two and replaces the `%` arithmetic with very fast bit masking. Activate it with `--features pow2` when building or testing.
+For workloads that need the lowest possible overhead on fixed-length buffers, enable the `pow2` feature and use `TinySetQueuePow2`. This variant requires the queue capacity to be a power of two and replaces the `%` arithmetic with very fast bit masking. The feature gate keeps the default build lean for users who do not need the specialized path; flip it on when you opt into the stricter buffer requirement and the extra code is worth the saved cycles. Activate it with `--features pow2` when building or testing.
 
 ```rust
 # #[cfg(feature = "pow2")]
