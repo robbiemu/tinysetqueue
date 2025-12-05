@@ -10,7 +10,7 @@ readme = "README.md"
 repository = "https://github.com/robbiemu/tinysetqueue"
 homepage = "https://github.com/robbiemu/tinysetqueue"
 documentation = "https://docs.rs/tinysetqueue"
-keywords = ["queue", "no-std", "embedded", "bfs", "dedupe"]
+keywords = ["queue", "no-std", "embedded", "bfs", "deduplications"]
 categories = ["algorithms", "data-structures", "embedded", "no-std"]
 
 [package.metadata.docs.rs]

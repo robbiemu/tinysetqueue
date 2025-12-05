@@ -6,7 +6,7 @@
 - Allocation-free API uses caller-provided ring-buffer storage
 - Direct-mapped membership bitmap deduplicates enqueues in O(1)
 - Two membership modes: `InQueue` (requeue after pop) and `Visited` (ban after first insert)
-- `no_std` by default; opt into the `std` feature when desired
+- Fully compatible with `no_std`
 - Works with `[bool]` backings for speed or `[u64]` bitsets for dense domains
 - Zero external dependencies and zero unsafe code
 
@@ -15,6 +15,7 @@
 ```rust
 use tinysetqueue::{MembershipMode, PushResult, TinySetQueue};
 
+// Note: The item type T must implement Copy + Into<usize>
 const CAPACITY: usize = 16;
 const DOMAIN: usize = 64;
 
@@ -28,6 +29,25 @@ assert_eq!(queue.push(4), Ok(PushResult::AlreadyPresent));
 assert_eq!(queue.pop(), Some(4));
 assert_eq!(queue.push(4), Ok(PushResult::Inserted)); // membership cleared by pop
 ```
+
+## Usage in `no_std` Environments
+
+This crate is fully compatible with `no_std` contexts. To use it in embedded or bare-metal projects, disable the default features (which include `std`) in your `Cargo.toml`:
+
+```toml
+[dependencies]
+tinysetqueue = { version = "0.2.1", default-features = false }
+```
+
+If you want the `clear_on_new` behavior (recommended) but not `std`:
+
+```toml
+[dependencies]
+tinysetqueue = { version = "0.2.1", default-features = false, features = ["clear_on_new"] }
+```
+
+The API remains identical. Since the queue relies entirely on caller-provided stack/static memory, no global allocator (`alloc`) is required.
+
 
 ## Choosing a Backing
 
