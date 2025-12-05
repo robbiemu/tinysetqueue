@@ -30,6 +30,7 @@ assert_eq!(queue.push(4), Ok(PushResult::Inserted)); // membership cleared by po
 
 ## Usage Notes
 
+- This is a **direct-mapped** queue: keys must map densely into `0..DOMAIN`. If you push `id.into() == 1_000_000`, your `in_queue` slice must be at least that long. For sparse identifiers, consider remapping or using a different data structure such as `HashSet`.
 - By default `TinySetQueue::new` clears the membership bitmap for you (feature `clear_on_new`). Disable it if you need to preserve pre-seeded membership data.
 - `MembershipMode::Visited` keeps membership markers set after popping. This makes the queue behave like a hybrid queue/set that only schedules each element once.
 - Reuse the queue by calling `clear` to reset membership and indices without reallocating.
@@ -46,6 +47,25 @@ assert_eq!(queue.push(4), Ok(PushResult::Inserted)); // membership cleared by po
 
 - `std` *(default)* — Pulls in the standard library so the crate can be used without a `#![no_std]` consumer.
 - `clear_on_new` *(default)* — Automatically zeroes the membership bitmap inside `TinySetQueue::new`. Disable to keep caller-supplied membership state.
+- `pow2` — Enables the bit-masking `TinySetQueuePow2` variant for power-of-two capacities.
+
+## Power-of-Two Variant
+
+For workloads that need the lowest possible overhead on fixed-length buffers, enable the `pow2` feature and use `TinySetQueuePow2`. This variant requires the queue capacity to be a power of two and replaces the `%` arithmetic with very fast bit masking. Activate it with `--features pow2` when building or testing.
+
+```rust
+# #[cfg(feature = "pow2")]
+# {
+use tinysetqueue::{MembershipMode, TinySetQueuePow2};
+
+let mut buf = [0u8; 8]; // power-of-two length
+let mut membership = [false; 16];
+let mut queue =
+  TinySetQueuePow2::new(&mut buf, &mut membership, MembershipMode::InQueue);
+# }
+```
+
+If the buffer length is not a power of two, the constructor panics.
 
 ## License
 
@@ -59,3 +79,12 @@ at your option.
 ### Contribution
 
 Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in this crate is licensed as described above.
+
+When adding changes, please run tests in both configurations to cover the `clear_on_new` feature toggle:
+
+```bash
+cargo test
+cargo test --no-default-features --features std
+cargo test --features pow2
+cargo test --no-default-features --features "std pow2"
+```

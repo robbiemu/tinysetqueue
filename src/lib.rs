@@ -4,6 +4,8 @@
 
 /// Prelude re-exporting the most commonly used items.
 pub mod prelude {
+    #[cfg(feature = "pow2")]
+    pub use super::TinySetQueuePow2;
     pub use super::{MembershipMode, PushResult, TinySetQueue};
 }
 
@@ -25,7 +27,11 @@ pub enum MembershipMode {
     Visited,
 }
 
-/// A fixed-capacity, allocation-free FIFO queue with membership tracking.
+/// A fixed-capacity, allocation-free FIFO queue with direct-mapped membership tracking.
+///
+/// Values are converted to indices via [`Into<usize>`], so the queue works best when
+/// keys are dense integers in the range `0..N`. Sparse identifiers (e.g. `{5, 1_000_000}`)
+/// require an `in_queue` slice large enough to cover the full domain.
 pub struct TinySetQueue<'a, T> {
     buf: &'a mut [T],
     in_queue: &'a mut [bool],
@@ -142,6 +148,120 @@ where
         }
 
         self.head = (self.head + 1) % self.buf.len();
+        self.len -= 1;
+
+        Some(value)
+    }
+}
+
+/// A power-of-two capacity variant that uses bit masking for wrap-around.
+///
+/// As with [`TinySetQueue`], membership is direct-mapped: the membership bitmap must be
+/// large enough to cover the entire domain addressable by `T::into()`.
+#[cfg(feature = "pow2")]
+pub struct TinySetQueuePow2<'a, T> {
+    buf: &'a mut [T],
+    in_queue: &'a mut [bool],
+    mode: MembershipMode,
+    mask: usize,
+    head: usize,
+    tail: usize,
+    len: usize,
+}
+
+#[cfg(feature = "pow2")]
+impl<'a, T> TinySetQueuePow2<'a, T>
+where
+    T: Copy + Into<usize>,
+{
+    /// Constructs a queue backed by power-of-two-sized storage.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `buf.len()` is not a power of two.
+    pub fn new(buf: &'a mut [T], in_queue: &'a mut [bool], mode: MembershipMode) -> Self {
+        assert!(
+            buf.len().is_power_of_two(),
+            "buffer length must be a power of two"
+        );
+        #[cfg(feature = "clear_on_new")]
+        in_queue.fill(false);
+        let mask = buf.len() - 1;
+        TinySetQueuePow2 {
+            buf,
+            in_queue,
+            mode,
+            mask,
+            head: 0,
+            tail: 0,
+            len: 0,
+        }
+    }
+
+    /// Clears the queue without freeing any backing storage.
+    pub fn clear(&mut self) {
+        self.in_queue.fill(false);
+        self.head = 0;
+        self.tail = 0;
+        self.len = 0;
+    }
+
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        self.buf.len()
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    #[inline]
+    pub fn is_full(&self) -> bool {
+        self.len == self.buf.len()
+    }
+
+    pub fn push(&mut self, value: T) -> Result<PushResult, T> {
+        let idx: usize = value.into();
+
+        if idx >= self.in_queue.len() {
+            return Err(value);
+        }
+
+        if self.in_queue[idx] {
+            return Ok(PushResult::AlreadyPresent);
+        }
+
+        if self.is_full() {
+            return Err(value);
+        }
+
+        self.buf[self.tail] = value;
+        self.in_queue[idx] = true;
+
+        self.tail = (self.tail + 1) & self.mask;
+        self.len += 1;
+
+        Ok(PushResult::Inserted)
+    }
+
+    pub fn pop(&mut self) -> Option<T> {
+        if self.is_empty() {
+            return None;
+        }
+
+        let value = self.buf[self.head];
+        let idx: usize = value.into();
+        if matches!(self.mode, MembershipMode::InQueue) {
+            self.in_queue[idx] = false;
+        }
+
+        self.head = (self.head + 1) & self.mask;
         self.len -= 1;
 
         Some(value)
@@ -274,5 +394,41 @@ mod tests {
         assert!(queue.is_full());
         assert_eq!(queue.push(0), Err(0));
         assert_eq!(queue.pop(), None);
+    }
+}
+
+#[cfg(all(test, feature = "pow2"))]
+mod pow2_tests {
+    use super::{MembershipMode, PushResult, TinySetQueuePow2};
+
+    #[test]
+    fn rejects_non_power_of_two() {
+        let mut buf = [0u8; 3];
+        let mut membership = [false; 8];
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            TinySetQueuePow2::new(&mut buf, &mut membership, MembershipMode::InQueue);
+        }));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn push_pop_wraparound_uses_mask() {
+        let mut buf = [0u8; 4];
+        let mut membership = [false; 8];
+        let mut queue = TinySetQueuePow2::new(&mut buf, &mut membership, MembershipMode::InQueue);
+
+        assert_eq!(queue.push(0), Ok(PushResult::Inserted));
+        assert_eq!(queue.push(1), Ok(PushResult::Inserted));
+        assert_eq!(queue.push(2), Ok(PushResult::Inserted));
+        assert_eq!(queue.push(3), Ok(PushResult::Inserted));
+        assert!(queue.is_full());
+
+        assert_eq!(queue.pop(), Some(0));
+        assert_eq!(queue.push(0), Ok(PushResult::Inserted));
+        assert_eq!(queue.pop(), Some(1));
+        assert_eq!(queue.pop(), Some(2));
+        assert_eq!(queue.pop(), Some(3));
+        assert_eq!(queue.pop(), Some(0));
+        assert!(queue.is_empty());
     }
 }
