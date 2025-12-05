@@ -1,130 +1,61 @@
-# **`tinysetqueue`: A Stack-Allocated, Deduplicating FIFO Queue**
+# tinysetqueue
 
-`tinysetqueue` fills a critical gap in the Rust ecosystem: a **stack-allocated, allocation-free FIFO queue with built-in membership tracking** for **dense integer domains**. Traditional queues (`VecDeque`, `heapless::Deque`) guarantee FIFO behavior but cannot prevent duplicate enqueueing without external bookkeeping. Set-like structures (`BitSet`, `HashSet`) track membership but provide no ordering guarantees. Many algorithms—BFS, flood fills, constraint propagation—require **both** properties simultaneously, especially in memory-constrained environments.
+`tinysetqueue` is a stack-allocated FIFO queue with built-in membership tracking for dense integer domains. It eliminates duplicate work while keeping latency and memory usage predictable—ideal for embedded, `no_std`, and data-structure heavy workloads such as BFS, frontier expansion, and constraint propagation.
 
-This crate codifies a proven pattern: a fixed-capacity ring buffer paired with a direct-mapped membership array, providing O(1) push/pop with automatic deduplication and **zero heap allocation**.
+## Highlights
+- Allocation-free API uses caller-provided ring-buffer storage
+- Direct-mapped membership bitmap deduplicates enqueues in O(1)
+- Two membership modes: `InQueue` (requeue after pop) and `Visited` (ban after first insert)
+- `no_std` by default; opt into the `std` feature when desired
+- Zero external dependencies and zero unsafe code
 
-## **Core Use Cases**
-
-* BFS and shortest-path on microcontrollers or in `no_std` kernels
-* Sparse-update simulations and cellular automata avoiding duplicate work
-* Topological frontier peeling with `Visited` semantics
-* Any algorithm where IDs are dense integers (0..N) and memory is non-negotiable
-
-## **Example: Flood Fill**
-
-Map 2D coordinates to a dense integer index and guarantee each cell processes exactly once:
+## Quick Start
 
 ```rust
-// (x, y) -> usize via y * WIDTH + x
-let mut queue = TinySetQueue::new(&mut buf, &mut seen, MembershipMode::InQueue);
-queue.push(start_id);
+use tinysetqueue::{MembershipMode, PushResult, TinySetQueue};
 
-while let Some(id) = queue.pop() {
-    // Process cell...
-    for neighbor in neighbors(id) {
-        queue.push(neighbor); // No duplicate work, no allocation
-    }
-}
+const CAPACITY: usize = 16;
+const DOMAIN: usize = 64;
+
+let mut buf = [0u16; CAPACITY];
+let mut membership = [false; DOMAIN];
+let mut queue =
+  TinySetQueue::new(&mut buf, &mut membership, MembershipMode::InQueue);
+
+assert_eq!(queue.push(4), Ok(PushResult::Inserted));
+assert_eq!(queue.push(4), Ok(PushResult::AlreadyPresent));
+assert_eq!(queue.pop(), Some(4));
+assert_eq!(queue.push(4), Ok(PushResult::Inserted)); // membership cleared by pop
 ```
 
-## **Key Features**
+## Usage Notes
 
-* **Direct-Mapped Deduplication**: Uses `Into<usize>` for O(1) membership checks. **Best for dense integer keys** (array indices, entity IDs 0..N). Sparse IDs require proportional allocation.
-* **Memory vs. Speed Trade-off**: v0.1 uses `[bool]` for the membership array, prioritizing CPU speed and code simplicity over bit-packing density (8x memory vs. a bitset).
-* **Dual Membership Modes**:
-  * `InQueue`: Re-enqueue after popping (standard BFS)
-  * `Visited`: Permanent ban after first insert (topological peeling)
-* **Zero Dependencies, `no_std` Compatible**: Works on stable Rust in any environment.
+- By default `TinySetQueue::new` clears the membership bitmap for you (feature `clear_on_new`). Disable it if you need to preserve pre-seeded membership data.
+- `MembershipMode::Visited` keeps membership markers set after popping. This makes the queue behave like a hybrid queue/set that only schedules each element once.
+- Reuse the queue by calling `clear` to reset membership and indices without reallocating.
+- By default the crate compiles in `no_std` mode. Enable the `std` feature to integrate with standard-library environments without needing `#![no_std]` in your binary.
 
-## **Corrected Implementation (v0.1)**
+## When to Reach for tinysetqueue
 
-```rust
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub enum PushResult {
-    Inserted,
-    AlreadyPresent,
-}
+- BFS, Dijkstra-lite, IDA*, or flood-fill algorithms on microcontrollers
+- Cellular automata or constraint propagation where duplicate work must be suppressed
+- Graph traversals keyed by dense integer handles (entity/component IDs, array offsets)
+- Simulation step scheduling where memory predictability matters as much as time
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub enum MembershipMode {
-    InQueue,
-    Visited,
-}
+## Feature Flags
 
-pub struct TinySetQueue<'a, T> {
-    buf: &'a mut [T],
-    in_queue: &'a mut [bool],
-    mode: MembershipMode,
-    head: usize,
-    tail: usize,
-    len: usize,
-}
+- `std` *(default)* — Pulls in the standard library so the crate can be used without a `#![no_std]` consumer.
+- `clear_on_new` *(default)* — Automatically zeroes the membership bitmap inside `TinySetQueue::new`. Disable to keep caller-supplied membership state.
 
-impl<'a, T> TinySetQueue<'a, T>
-where
-    T: Copy + Into<usize>,
-{
-    /// Creates a new queue. **Clears the `in_queue` slice** to ensure safety.
-    pub fn new(
-        buf: &'a mut [T],
-        in_queue: &'a mut [bool],
-        mode: MembershipMode,
-    ) -> Self {
-        // CRITICAL: Prevent false positives from garbage data
-        for flag in in_queue.iter_mut() {
-            *flag = false;
-        }
+## License
 
-        TinySetQueue {
-            buf,
-            in_queue,
-            mode,
-            head: 0,
-            tail: 0,
-            len: 0,
-        }
-    }
+Licensed under either of
 
-    /// Resets the queue for reuse without reallocating buffers.
-    pub fn clear(&mut self) {
-        for flag in self.in_queue.iter_mut() {
-            *flag = false;
-        }
-        self.head = 0;
-        self.tail = 0;
-        self.len = 0;
-    }
+- MIT license ([LICENSE-MIT](LICENSE-MIT) or <https://opensource.org/licenses/MIT>)
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or <https://www.apache.org/licenses/LICENSE-2.0>)
 
-    // ... push, pop, len, is_empty ...
-}
-```
+at your option.
 
-## **Future Roadmap (v0.2)**
+### Contribution
 
-To address the density trade-off without breaking API compatibility, we will introduce a `SetBacking` trait:
-
-```rust
-pub trait SetBacking {
-    fn contains(&self, index: usize) -> bool;
-    fn insert(&mut self, index: usize);
-    fn clear(&mut self);
-}
-
-// Implement for [bool] (default) and [u32] (bitset)
-```
-
-This allows users to opt into bit-level density if memory constraints demand it—no core logic changes required.
-
-## **Why a Dedicated Crate?**
-
-This pattern is **repeatedly reinvented** in embedded projects, competitive programming, and systems code. A standalone crate provides:
-
-* **Tested, reusable abstraction** instead of ad-hoc, bug-prone rewrites
-* **Clear semantics** distinguishing `InQueue` vs. `Visited` modes
-* **Drop-in readiness** for `no_std` environments
-* **Ergonomic safety** around initialization and reuse (`clear()`)
-
-`tinysetqueue` is not a general-purpose queue—it is a **specialized primitive** for dense integer domains where allocation is forbidden and duplicate suppression is mandatory. It codifies an algorithmic pattern that is common, useful, and currently underserved.
-
-**Publish v0.1. Fix `new`, keep it simple, and ship.**
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in this crate is licensed as described above.
