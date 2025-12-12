@@ -173,6 +173,15 @@ pub enum MembershipMode {
     Visited,
 }
 
+/// Controls the processing order of the queue.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum Order {
+    /// First-in, first-out processing (default).
+    FIFO,
+    /// Last-in, first-out processing.
+    LIFO,
+}
+
 /// A fixed-capacity, allocation-free FIFO queue with direct-mapped membership tracking.
 ///
 /// Values are converted to indices via [`Into<usize>`], so the queue works best when
@@ -185,6 +194,7 @@ where
     buf: &'a mut [T],
     in_queue: &'a mut S,
     mode: MembershipMode,
+    order: Order,
     head: usize,
     tail: usize,
     len: usize,
@@ -205,12 +215,23 @@ where
     /// `clear_on_new` feature (enabled by default) is active, the backing is cleared to
     /// prevent stale membership flags.
     pub fn new(buf: &'a mut [T], in_queue: &'a mut S, mode: MembershipMode) -> Self {
+        Self::new_with_order(buf, in_queue, mode, Order::FIFO)
+    }
+
+    /// Constructs a queue with a specific processing order.
+    pub fn new_with_order(
+        buf: &'a mut [T],
+        in_queue: &'a mut S,
+        mode: MembershipMode,
+        order: Order,
+    ) -> Self {
         #[cfg(feature = "clear_on_new")]
         in_queue.clear_all();
         TinySetQueue {
             buf,
             in_queue,
             mode,
+            order,
             head: 0,
             tail: 0,
             len: 0,
@@ -281,8 +302,9 @@ where
         Ok(PushResult::Inserted)
     }
 
-    /// Pops the oldest value from the queue, if any.
+    /// Pops a value from the queue, if any.
     ///
+    /// The processing order depends on the `Order` variant selected at construction.
     /// Membership is cleared in [`MembershipMode::InQueue`] and retained in
     /// [`MembershipMode::Visited`].
     pub fn pop(&mut self) -> Option<T> {
@@ -290,14 +312,22 @@ where
             return None;
         }
 
-        let value = self.buf[self.head];
-        let idx: usize = value.into();
+        let value = match self.order {
+            Order::FIFO => {
+                let value = self.buf[self.head];
+                self.head = (self.head + 1) % self.buf.len();
+                value
+            }
+            Order::LIFO => {
+                self.tail = (self.tail + self.buf.len() - 1) % self.buf.len();
+                self.buf[self.tail]
+            }
+        };
 
+        let idx: usize = value.into();
         if matches!(self.mode, MembershipMode::InQueue) {
             self.in_queue.remove(idx);
         }
-
-        self.head = (self.head + 1) % self.buf.len();
         self.len -= 1;
 
         Some(value)
@@ -316,6 +346,7 @@ where
     buf: &'a mut [T],
     in_queue: &'a mut S,
     mode: MembershipMode,
+    order: Order,
     mask: usize,
     head: usize,
     tail: usize,
@@ -334,6 +365,20 @@ where
     ///
     /// Panics if `buf.len()` is not a power of two.
     pub fn new(buf: &'a mut [T], in_queue: &'a mut S, mode: MembershipMode) -> Self {
+        Self::new_with_order(buf, in_queue, mode, Order::FIFO)
+    }
+
+    /// Constructs a power-of-two queue with a specific processing order.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `buf.len()` is not a power of two.
+    pub fn new_with_order(
+        buf: &'a mut [T],
+        in_queue: &'a mut S,
+        mode: MembershipMode,
+        order: Order,
+    ) -> Self {
         assert!(
             buf.len().is_power_of_two(),
             "buffer length must be a power of two"
@@ -345,6 +390,7 @@ where
             buf,
             in_queue,
             mode,
+            order,
             mask,
             head: 0,
             tail: 0,
@@ -409,13 +455,22 @@ where
             return None;
         }
 
-        let value = self.buf[self.head];
+        let value = match self.order {
+            Order::FIFO => {
+                let value = self.buf[self.head];
+                self.head = (self.head + 1) & self.mask;
+                value
+            }
+            Order::LIFO => {
+                self.tail = (self.tail.wrapping_sub(1)) & self.mask;
+                self.buf[self.tail]
+            }
+        };
+
         let idx: usize = value.into();
         if matches!(self.mode, MembershipMode::InQueue) {
             self.in_queue.remove(idx);
         }
-
-        self.head = (self.head + 1) & self.mask;
         self.len -= 1;
 
         Some(value)
@@ -424,7 +479,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{MembershipMode, PushResult, TinySetQueue};
+    use super::{MembershipMode, Order, PushResult, TinySetQueue};
 
     #[test]
     fn basic_push_pop_in_queue() {
@@ -584,11 +639,47 @@ mod tests {
         assert_eq!(queue.pop(), Some(10));
         assert_eq!(queue.push(10), Ok(PushResult::AlreadyPresent));
     }
+
+    #[test]
+    fn lifo_push_pop_order() {
+        let mut buf = [0u8; 4];
+        let mut membership = [false; 8];
+        let mut queue =
+            TinySetQueue::new_with_order(&mut buf, &mut membership, MembershipMode::InQueue, Order::LIFO);
+
+        assert_eq!(queue.push(1), Ok(PushResult::Inserted));
+        assert_eq!(queue.push(2), Ok(PushResult::Inserted));
+        assert_eq!(queue.len(), 2);
+
+        assert_eq!(queue.pop(), Some(2));
+        assert_eq!(queue.pop(), Some(1));
+        assert_eq!(queue.len(), 0);
+    }
+
+    #[test]
+    fn lifo_wraparound_push_pop() {
+        let mut buf = [0u8; 3];
+        let mut membership = [false; 8];
+        let mut queue =
+            TinySetQueue::new_with_order(&mut buf, &mut membership, MembershipMode::InQueue, Order::LIFO);
+
+        assert_eq!(queue.push(1), Ok(PushResult::Inserted));
+        assert_eq!(queue.push(2), Ok(PushResult::Inserted));
+        assert_eq!(queue.push(3), Ok(PushResult::Inserted));
+        assert!(queue.is_full());
+
+        assert_eq!(queue.pop(), Some(3));
+        assert_eq!(queue.push(4), Ok(PushResult::Inserted));
+        assert_eq!(queue.pop(), Some(4));
+        assert_eq!(queue.pop(), Some(2));
+        assert_eq!(queue.pop(), Some(1));
+        assert!(queue.is_empty());
+    }
 }
 
 #[cfg(all(test, feature = "pow2", feature = "std"))]
 mod pow2_tests {
-    use super::{MembershipMode, PushResult, TinySetQueuePow2};
+    use super::{MembershipMode, Order, PushResult, TinySetQueuePow2};
 
     #[test]
     fn rejects_non_power_of_two() {
@@ -631,5 +722,23 @@ mod pow2_tests {
         assert_eq!(queue.push(17), Ok(PushResult::Inserted));
         assert_eq!(queue.pop(), Some(1));
         assert_eq!(queue.push(1), Ok(PushResult::Inserted));
+    }
+
+    #[test]
+    fn pow2_lifo_push_pop_order() {
+        let mut buf = [0u8; 4];
+        let mut membership = [false; 8];
+        let mut queue = TinySetQueuePow2::new_with_order(
+            &mut buf,
+            &mut membership,
+            MembershipMode::InQueue,
+            Order::LIFO,
+        );
+
+        assert_eq!(queue.push(1), Ok(PushResult::Inserted));
+        assert_eq!(queue.push(2), Ok(PushResult::Inserted));
+
+        assert_eq!(queue.pop(), Some(2));
+        assert_eq!(queue.pop(), Some(1));
     }
 }

@@ -9,6 +9,7 @@
 - `no_std` by default; opt into the `std` feature when desired
 - Works with `[bool]` backings for speed or `[u64]` bitsets for dense domains
 - Zero external dependencies and zero unsafe code
+- Configurable FIFO (default) or LIFO processing order
 
 ## Quick Start
 
