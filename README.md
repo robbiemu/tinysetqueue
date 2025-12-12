@@ -1,27 +1,33 @@
 # tinysetqueue
 
-`tinysetqueue` is a stack-allocated FIFO queue with built-in membership tracking for dense integer domains. It eliminates duplicate work while keeping latency and memory usage predictable—ideal for embedded, `no_std`, and data-structure heavy workloads such as BFS, frontier expansion, and constraint propagation.
+`tinysetqueue` is a stack-allocated queue with configurable FIFO or LIFO processing and built-in membership tracking for dense integer domains. It eliminates duplicate work while keeping latency and memory usage predictable—ideal for embedded, `no_std`, and data-structure heavy workloads such as BFS, frontier expansion, and constraint propagation.
 
 ## Highlights
 - Allocation-free API uses caller-provided ring-buffer storage
+- Toggle FIFO or LIFO behavior per queue via `ProcessingOrder`
 - Direct-mapped membership bitmap deduplicates enqueues in O(1)
 - Two membership modes: `InQueue` (requeue after pop) and `Visited` (ban after first insert)
-- `no_std` by default; opt into the `std` feature when desired
+- Fully compatible with `no_std`
 - Works with `[bool]` backings for speed or `[u64]` bitsets for dense domains
 - Zero external dependencies and zero unsafe code
 
 ## Quick Start
 
 ```rust
-use tinysetqueue::{MembershipMode, PushResult, TinySetQueue};
+use tinysetqueue::{MembershipMode, ProcessingOrder, PushResult, TinySetQueue};
 
+// Note: The item type T must implement Copy + Into<usize>
 const CAPACITY: usize = 16;
 const DOMAIN: usize = 64;
 
 let mut buf = [0u16; CAPACITY];
 let mut membership = [false; DOMAIN];
-let mut queue =
-  TinySetQueue::new(&mut buf, &mut membership, MembershipMode::InQueue);
+let mut queue = TinySetQueue::new(
+  &mut buf,
+  &mut membership,
+  MembershipMode::InQueue,
+  ProcessingOrder::Fifo,
+);
 
 assert_eq!(queue.push(4), Ok(PushResult::Inserted));
 assert_eq!(queue.push(4), Ok(PushResult::AlreadyPresent));
@@ -29,22 +35,51 @@ assert_eq!(queue.pop(), Some(4));
 assert_eq!(queue.push(4), Ok(PushResult::Inserted)); // membership cleared by pop
 ```
 
+## Usage in `no_std` Environments
+
+This crate is fully compatible with `no_std` contexts. To use it in embedded or bare-metal projects, disable the default features (which include `std`) in your `Cargo.toml`:
+
+```toml
+[dependencies]
+tinysetqueue = { version = "0.3.0", default-features = false }
+```
+
+If you want the `clear_on_new` behavior (recommended) but not `std`:
+
+```toml
+[dependencies]
+tinysetqueue = { version = "0.3.0", default-features = false, features = ["clear_on_new"] }
+```
+
+The API remains identical. Since the queue relies entirely on caller-provided stack/static memory, no global allocator (`alloc`) is required.
+
+
 ## Choosing a Backing
 
 `TinySetQueue` accepts any membership storage that implements its sealed `SetBacking` trait. Supply the backing that best matches your constraints:
 
 ```rust
-use tinysetqueue::{MembershipMode, TinySetQueue};
+use tinysetqueue::{MembershipMode, ProcessingOrder, TinySetQueue};
 
 let mut buf = [0u16; 4];
 
 // Fast path: 1 byte per element.
 let mut bitmap = [false; 32];
-let mut queue = TinySetQueue::new(&mut buf, &mut bitmap, MembershipMode::InQueue);
+let mut queue = TinySetQueue::new(
+  &mut buf,
+  &mut bitmap,
+  MembershipMode::InQueue,
+  ProcessingOrder::Fifo,
+);
 
 // Memory-dense path: 1 bit per element (requires domain <= 64 * backing.len()).
 let mut bitset = [0u64; 1];
-let mut dense_queue = TinySetQueue::new(&mut buf, &mut bitset, MembershipMode::InQueue);
+let mut dense_queue = TinySetQueue::new(
+  &mut buf,
+  &mut bitset,
+  MembershipMode::InQueue,
+  ProcessingOrder::Fifo,
+);
 ```
 
 Both queues share the same API; the compiler infers the correct backing behavior from the slice you pass.
@@ -54,6 +89,7 @@ Both queues share the same API; the compiler infers the correct backing behavior
 - This is a **direct-mapped** queue: keys must map densely into `0..DOMAIN`. If you push `id.into() == 1_000_000`, your `in_queue` slice must be at least that long. For sparse identifiers, consider remapping or using a different data structure such as `HashSet`.
 - By default `TinySetQueue::new` clears the membership bitmap for you (feature `clear_on_new`). Disable it if you need to preserve pre-seeded membership data.
 - `MembershipMode::Visited` keeps membership markers set after popping. This makes the queue behave like a hybrid queue/set that only schedules each element once.
+- Select FIFO or LIFO semantics per queue by passing the desired `ProcessingOrder` to `TinySetQueue::new`.
 - Reuse the queue by calling `clear` to reset membership and indices without reallocating.
 - By default the crate compiles in `no_std` mode. Enable the `std` feature to integrate with standard-library environments without needing `#![no_std]` in your binary.
 
@@ -77,12 +113,16 @@ For workloads that need the lowest possible overhead on fixed-length buffers, en
 ```rust
 # #[cfg(feature = "pow2")]
 # {
-use tinysetqueue::{MembershipMode, TinySetQueuePow2};
+use tinysetqueue::{MembershipMode, ProcessingOrder, TinySetQueuePow2};
 
 let mut buf = [0u8; 8]; // power-of-two length
 let mut membership = [false; 16];
-let mut queue =
-  TinySetQueuePow2::new(&mut buf, &mut membership, MembershipMode::InQueue);
+let mut queue = TinySetQueuePow2::new(
+  &mut buf,
+  &mut membership,
+  MembershipMode::InQueue,
+  ProcessingOrder::Fifo,
+);
 # }
 ```
 
