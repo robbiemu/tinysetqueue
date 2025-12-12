@@ -6,7 +6,9 @@
 pub mod prelude {
   #[cfg(feature = "pow2")]
   pub use super::TinySetQueuePow2;
-  pub use super::{MembershipMode, PushResult, SetBacking, TinySetQueue};
+  pub use super::{
+    MembershipMode, ProcessingOrder, PushResult, SetBacking, TinySetQueue,
+  };
 }
 
 mod private {
@@ -173,7 +175,16 @@ pub enum MembershipMode {
   Visited,
 }
 
-/// A fixed-capacity, allocation-free FIFO queue with direct-mapped membership tracking.
+/// Controls whether values are processed in FIFO or LIFO order.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum ProcessingOrder {
+  /// First-in, first-out processing (queue semantics).
+  Fifo,
+  /// Last-in, first-out processing (stack semantics).
+  Lifo,
+}
+
+/// A fixed-capacity, allocation-free queue with direct-mapped membership tracking.
 ///
 /// Values are converted to indices via [`Into<usize>`], so the queue works best when
 /// keys are dense integers in the range `0..N`. Sparse identifiers (e.g. `{5, 1_000_000}`)
@@ -190,6 +201,7 @@ where
   buf: &'a mut [T],
   in_queue: &'a mut S,
   mode: MembershipMode,
+  order: ProcessingOrder,
   head: usize,
   tail: usize,
   len: usize,
@@ -202,9 +214,10 @@ where
 {
   /// Constructs a queue backed by caller-provided storage.
   ///
-  /// * `buf` supplies the ring-buffer storage used for FIFO ordering.
+  /// * `buf` supplies the ring-buffer storage used for pending values.
   /// * `in_queue` is the direct-mapped membership backing (e.g. `[bool]`, `[u64]`).
   /// * `mode` determines whether membership clears on `pop`.
+  /// * `order` selects FIFO or LIFO processing of queued values.
   ///
   /// `in_queue.capacity()` must exceed any index produced by `value.into()`. When the
   /// `clear_on_new` feature (enabled by default) is active, the backing is cleared to
@@ -213,10 +226,19 @@ where
     buf: &'a mut [T],
     in_queue: &'a mut S,
     mode: MembershipMode,
+    order: ProcessingOrder,
   ) -> Self {
     #[cfg(feature = "clear_on_new")]
     in_queue.clear_all();
-    TinySetQueue { buf, in_queue, mode, head: 0, tail: 0, len: 0 }
+    TinySetQueue {
+      buf,
+      in_queue,
+      mode,
+      order,
+      head: 0,
+      tail: 0,
+      len: 0,
+    }
   }
 
   /// Clears the queue without freeing any backing storage.
@@ -283,7 +305,7 @@ where
     Ok(PushResult::Inserted)
   }
 
-  /// Pops the oldest value from the queue, if any.
+  /// Pops the next value according to the configured processing order, if any.
   ///
   /// Membership is cleared in [`MembershipMode::InQueue`] and retained in
   /// [`MembershipMode::Visited`].
@@ -292,14 +314,31 @@ where
       return None;
     }
 
-    let value = self.buf[self.head];
+    let index = match self.order {
+      ProcessingOrder::Fifo => {
+        let idx = self.head;
+        self.head = (self.head + 1) % self.buf.len();
+        idx
+      }
+      ProcessingOrder::Lifo => {
+        debug_assert!(self.buf.len() > 0);
+        let idx = if self.tail == 0 {
+          self.buf.len() - 1
+        } else {
+          self.tail - 1
+        };
+        self.tail = idx;
+        idx
+      }
+    };
+
+    let value = self.buf[index];
     let idx: usize = value.into();
 
     if matches!(self.mode, MembershipMode::InQueue) {
       self.in_queue.remove(idx);
     }
 
-    self.head = (self.head + 1) % self.buf.len();
     self.len -= 1;
 
     Some(value)
@@ -318,6 +357,7 @@ where
   buf: &'a mut [T],
   in_queue: &'a mut S,
   mode: MembershipMode,
+  order: ProcessingOrder,
   mask: usize,
   head: usize,
   tail: usize,
@@ -339,6 +379,7 @@ where
     buf: &'a mut [T],
     in_queue: &'a mut S,
     mode: MembershipMode,
+    order: ProcessingOrder,
   ) -> Self {
     assert!(
       buf.len().is_power_of_two(),
@@ -347,7 +388,16 @@ where
     #[cfg(feature = "clear_on_new")]
     in_queue.clear_all();
     let mask = buf.len() - 1;
-    TinySetQueuePow2 { buf, in_queue, mode, mask, head: 0, tail: 0, len: 0 }
+    TinySetQueuePow2 {
+      buf,
+      in_queue,
+      mode,
+      order,
+      mask,
+      head: 0,
+      tail: 0,
+      len: 0,
+    }
   }
 
   /// Clears the queue without freeing any backing storage.
@@ -407,13 +457,25 @@ where
       return None;
     }
 
-    let value = self.buf[self.head];
+    let index = match self.order {
+      ProcessingOrder::Fifo => {
+        let idx = self.head;
+        self.head = (self.head + 1) & self.mask;
+        idx
+      }
+      ProcessingOrder::Lifo => {
+        let idx = (self.tail.wrapping_sub(1)) & self.mask;
+        self.tail = idx;
+        idx
+      }
+    };
+
+    let value = self.buf[index];
     let idx: usize = value.into();
     if matches!(self.mode, MembershipMode::InQueue) {
       self.in_queue.remove(idx);
     }
 
-    self.head = (self.head + 1) & self.mask;
     self.len -= 1;
 
     Some(value)
@@ -422,14 +484,18 @@ where
 
 #[cfg(test)]
 mod tests {
-  use super::{MembershipMode, PushResult, TinySetQueue};
+  use super::{MembershipMode, ProcessingOrder, PushResult, TinySetQueue};
 
   #[test]
   fn basic_push_pop_in_queue() {
     let mut buf = [0u8; 4];
     let mut membership = [false; 8];
-    let mut queue =
-      TinySetQueue::new(&mut buf, &mut membership, MembershipMode::InQueue);
+    let mut queue = TinySetQueue::new(
+      &mut buf,
+      &mut membership,
+      MembershipMode::InQueue,
+      ProcessingOrder::Fifo,
+    );
 
     assert!(queue.is_empty());
     assert_eq!(queue.capacity(), 4);
@@ -449,8 +515,12 @@ mod tests {
   fn visited_mode_prevents_requeue() {
     let mut buf = [0u8; 4];
     let mut membership = [false; 8];
-    let mut queue =
-      TinySetQueue::new(&mut buf, &mut membership, MembershipMode::Visited);
+    let mut queue = TinySetQueue::new(
+      &mut buf,
+      &mut membership,
+      MembershipMode::Visited,
+      ProcessingOrder::Fifo,
+    );
 
     assert_eq!(queue.push(2), Ok(PushResult::Inserted));
     assert_eq!(queue.pop(), Some(2));
@@ -458,11 +528,38 @@ mod tests {
   }
 
   #[test]
+  fn lifo_order_pops_most_recent() {
+    let mut buf = [0u8; 4];
+    let mut membership = [false; 8];
+    let mut queue = TinySetQueue::new(
+      &mut buf,
+      &mut membership,
+      MembershipMode::InQueue,
+      ProcessingOrder::Lifo,
+    );
+
+    assert_eq!(queue.push(1), Ok(PushResult::Inserted));
+    assert_eq!(queue.push(2), Ok(PushResult::Inserted));
+    assert_eq!(queue.push(3), Ok(PushResult::Inserted));
+    assert_eq!(queue.len(), 3);
+
+    assert_eq!(queue.pop(), Some(3));
+    assert_eq!(queue.pop(), Some(2));
+    assert_eq!(queue.pop(), Some(1));
+    assert!(queue.is_empty());
+    assert_eq!(queue.push(1), Ok(PushResult::Inserted));
+  }
+
+  #[test]
   fn clear_resets_membership_and_indices() {
     let mut buf = [0u8; 2];
     let mut membership = [false; 4];
-    let mut queue =
-      TinySetQueue::new(&mut buf, &mut membership, MembershipMode::InQueue);
+    let mut queue = TinySetQueue::new(
+      &mut buf,
+      &mut membership,
+      MembershipMode::InQueue,
+      ProcessingOrder::Fifo,
+    );
 
     assert_eq!(queue.push(0), Ok(PushResult::Inserted));
     assert_eq!(queue.push(1), Ok(PushResult::Inserted));
@@ -479,8 +576,12 @@ mod tests {
   fn new_clears_membership_bitmap() {
     let mut buf = [0u8; 2];
     let mut membership = [true; 4];
-    let mut queue =
-      TinySetQueue::new(&mut buf, &mut membership, MembershipMode::InQueue);
+    let mut queue = TinySetQueue::new(
+      &mut buf,
+      &mut membership,
+      MembershipMode::InQueue,
+      ProcessingOrder::Fifo,
+    );
 
     assert!(queue.is_empty());
     assert_eq!(queue.push(0), Ok(PushResult::Inserted));
@@ -491,8 +592,12 @@ mod tests {
   fn new_preserves_membership_bitmap() {
     let mut buf = [0u8; 2];
     let mut membership = [true; 4];
-    let mut queue =
-      TinySetQueue::new(&mut buf, &mut membership, MembershipMode::InQueue);
+    let mut queue = TinySetQueue::new(
+      &mut buf,
+      &mut membership,
+      MembershipMode::InQueue,
+      ProcessingOrder::Fifo,
+    );
 
     assert!(queue.is_empty());
     assert_eq!(queue.push(0), Ok(PushResult::AlreadyPresent));
@@ -502,8 +607,12 @@ mod tests {
   fn push_rejects_out_of_range_index() {
     let mut buf = [0u8; 2];
     let mut membership = [false; 2];
-    let mut queue =
-      TinySetQueue::new(&mut buf, &mut membership, MembershipMode::InQueue);
+    let mut queue = TinySetQueue::new(
+      &mut buf,
+      &mut membership,
+      MembershipMode::InQueue,
+      ProcessingOrder::Fifo,
+    );
 
     assert_eq!(queue.push(3), Err(3));
     assert!(queue.is_empty());
@@ -513,8 +622,12 @@ mod tests {
   fn push_rejects_when_full() {
     let mut buf = [0u8; 2];
     let mut membership = [false; 4];
-    let mut queue =
-      TinySetQueue::new(&mut buf, &mut membership, MembershipMode::InQueue);
+    let mut queue = TinySetQueue::new(
+      &mut buf,
+      &mut membership,
+      MembershipMode::InQueue,
+      ProcessingOrder::Fifo,
+    );
 
     assert_eq!(queue.push(0), Ok(PushResult::Inserted));
     assert_eq!(queue.push(1), Ok(PushResult::Inserted));
@@ -527,8 +640,12 @@ mod tests {
   fn ring_buffer_wraparound_preserves_membership() {
     let mut buf = [0u8; 3];
     let mut membership = [false; 6];
-    let mut queue =
-      TinySetQueue::new(&mut buf, &mut membership, MembershipMode::InQueue);
+    let mut queue = TinySetQueue::new(
+      &mut buf,
+      &mut membership,
+      MembershipMode::InQueue,
+      ProcessingOrder::Fifo,
+    );
 
     assert_eq!(queue.push(0), Ok(PushResult::Inserted));
     assert_eq!(queue.push(1), Ok(PushResult::Inserted));
@@ -547,8 +664,12 @@ mod tests {
   fn zero_capacity_queue_behaves_consistently() {
     let mut buf: [u8; 0] = [];
     let mut membership = [false; 1];
-    let mut queue =
-      TinySetQueue::new(&mut buf, &mut membership, MembershipMode::InQueue);
+    let mut queue = TinySetQueue::new(
+      &mut buf,
+      &mut membership,
+      MembershipMode::InQueue,
+      ProcessingOrder::Fifo,
+    );
 
     assert_eq!(queue.capacity(), 0);
     assert!(queue.is_empty());
@@ -561,8 +682,12 @@ mod tests {
   fn bitset_backing_handles_high_indices() {
     let mut buf = [0u16; 4];
     let mut membership = [0u64; 2]; // capacity 128
-    let mut queue =
-      TinySetQueue::new(&mut buf, &mut membership, MembershipMode::InQueue);
+    let mut queue = TinySetQueue::new(
+      &mut buf,
+      &mut membership,
+      MembershipMode::InQueue,
+      ProcessingOrder::Fifo,
+    );
 
     assert_eq!(queue.push(0), Ok(PushResult::Inserted));
     assert_eq!(queue.push(63), Ok(PushResult::Inserted));
@@ -576,8 +701,12 @@ mod tests {
   fn bitset_backing_enforces_capacity() {
     let mut buf = [0u8; 2];
     let mut membership = [0u64; 1]; // capacity 64
-    let mut queue =
-      TinySetQueue::new(&mut buf, &mut membership, MembershipMode::InQueue);
+    let mut queue = TinySetQueue::new(
+      &mut buf,
+      &mut membership,
+      MembershipMode::InQueue,
+      ProcessingOrder::Fifo,
+    );
 
     assert_eq!(queue.push(63), Ok(PushResult::Inserted));
     assert_eq!(queue.push(64), Err(64)); // out of range
@@ -587,8 +716,12 @@ mod tests {
   fn bitset_visited_mode_persists_membership() {
     let mut buf = [0u8; 2];
     let mut membership = [0u64; 1];
-    let mut queue =
-      TinySetQueue::new(&mut buf, &mut membership, MembershipMode::Visited);
+    let mut queue = TinySetQueue::new(
+      &mut buf,
+      &mut membership,
+      MembershipMode::Visited,
+      ProcessingOrder::Fifo,
+    );
 
     assert_eq!(queue.push(10), Ok(PushResult::Inserted));
     assert_eq!(queue.pop(), Some(10));
@@ -598,14 +731,19 @@ mod tests {
 
 #[cfg(all(test, feature = "pow2", feature = "std"))]
 mod pow2_tests {
-  use super::{MembershipMode, PushResult, TinySetQueuePow2};
+  use super::{MembershipMode, ProcessingOrder, PushResult, TinySetQueuePow2};
 
   #[test]
   fn rejects_non_power_of_two() {
     let mut buf = [0u8; 3];
     let mut membership = [false; 8];
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-      TinySetQueuePow2::new(&mut buf, &mut membership, MembershipMode::InQueue);
+      TinySetQueuePow2::new(
+        &mut buf,
+        &mut membership,
+        MembershipMode::InQueue,
+        ProcessingOrder::Fifo,
+      );
     }));
     assert!(result.is_err());
   }
@@ -614,8 +752,12 @@ mod pow2_tests {
   fn push_pop_wraparound_uses_mask() {
     let mut buf = [0u8; 4];
     let mut membership = [false; 8];
-    let mut queue =
-      TinySetQueuePow2::new(&mut buf, &mut membership, MembershipMode::InQueue);
+    let mut queue = TinySetQueuePow2::new(
+      &mut buf,
+      &mut membership,
+      MembershipMode::InQueue,
+      ProcessingOrder::Fifo,
+    );
 
     assert_eq!(queue.push(0), Ok(PushResult::Inserted));
     assert_eq!(queue.push(1), Ok(PushResult::Inserted));
@@ -633,11 +775,37 @@ mod pow2_tests {
   }
 
   #[test]
+  fn pow2_lifo_order_uses_tail() {
+    let mut buf = [0u8; 4];
+    let mut membership = [false; 32];
+    let mut queue = TinySetQueuePow2::new(
+      &mut buf,
+      &mut membership,
+      MembershipMode::InQueue,
+      ProcessingOrder::Lifo,
+    );
+
+    assert_eq!(queue.push(10), Ok(PushResult::Inserted));
+    assert_eq!(queue.push(11), Ok(PushResult::Inserted));
+    assert_eq!(queue.push(12), Ok(PushResult::Inserted));
+
+    assert_eq!(queue.pop(), Some(12));
+    assert_eq!(queue.pop(), Some(11));
+    assert_eq!(queue.pop(), Some(10));
+    assert!(queue.is_empty());
+    assert_eq!(queue.push(10), Ok(PushResult::Inserted));
+  }
+
+  #[test]
   fn pow2_supports_bitset_backing() {
     let mut buf = [0u8; 4];
     let mut membership = [0u64; 1];
-    let mut queue =
-      TinySetQueuePow2::new(&mut buf, &mut membership, MembershipMode::InQueue);
+    let mut queue = TinySetQueuePow2::new(
+      &mut buf,
+      &mut membership,
+      MembershipMode::InQueue,
+      ProcessingOrder::Fifo,
+    );
 
     assert_eq!(queue.push(1), Ok(PushResult::Inserted));
     assert_eq!(queue.push(17), Ok(PushResult::Inserted));
